@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.7.0",
+    version="1.8.0",
 )
 
 app.add_middleware(
@@ -105,7 +105,6 @@ async def fetch_messages_with_retry() -> List[Dict[str, Any]]:
         try:
             async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 resp = await client.get(MESSAGES_URL)
-                print(f"[upstream] attempt={i+1} status={resp.status_code}")
                 if resp.status_code == 200:
                     data = resp.json()
                     CACHE["data"] = data
@@ -117,7 +116,6 @@ async def fetch_messages_with_retry() -> List[Dict[str, Any]]:
             last_error_detail = f"Upstream request error: {e!s}"
         await asyncio.sleep(0.5 + 0.5 * i)
     if _is_fresh_cache():
-        print("[upstream] using cached messages")
         return _normalize_messages(CACHE["data"])
     raise HTTPException(status_code=502, detail=last_error_detail or "Upstream unreachable")
 
@@ -184,7 +182,6 @@ async def ask(body: AskBody):
     except HTTPException as e:
         raise e
     except Exception as e:
-        print(f"[ask] unexpected error during fetch: {e!r}")
         raise HTTPException(status_code=502, detail="Unexpected upstream handling error")
     if not messages:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
@@ -193,18 +190,40 @@ async def ask(body: AskBody):
     q_names = find_name_in_question(question)
     wants_when = ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower)
     wants_number = ("how many" in q_lower) or ("number" in q_lower)
-    asked_london = "london" in q_lower
-    asked_broadway = "broadway" in q_lower
 
-    candidate_msgs = messages
+    city_terms = {"london","paris","berlin","tokyo","dubai","zurich","vatican","rome","madrid","amsterdam","new york","san francisco","chicago","los angeles","la","seattle"}
+    asked_cities = {c for c in city_terms if c in q_lower}
+
+    candidate = messages
+
     if q_names:
-        filtered_by_name = [mm for mm in messages if mm.get("member") and any(n.lower() in mm["member"].lower() for n in q_names)]
-        if filtered_by_name:
-            candidate_msgs = filtered_by_name
-    if asked_london:
-        filtered_by_city = [mm for mm in candidate_msgs if "london" in (mm.get("text") or "").lower()]
-        if filtered_by_city:
-            candidate_msgs = filtered_by_city
+        tokens = [t.lower() for n in q_names for t in n.split()]
+        by_name = []
+        for mm in candidate:
+            member = (mm.get("member") or "")
+            txt = (mm.get("text") or "")
+            field = (member + " " + txt).lower()
+            if all(t in field for t in tokens):
+                by_name.append(mm)
+        if by_name:
+            candidate = by_name
+
+    if asked_cities:
+        by_city = []
+        for mm in candidate:
+            t = (mm.get("text") or "").lower()
+            if any(c in t for c in asked_cities):
+                by_city.append(mm)
+        if by_city:
+            candidate = by_city
+
+    if (q_names and asked_cities) and not candidate:
+        name_str = q_names[0]
+        city_str = ", ".join(sorted(asked_cities))
+        return {"answer": f"I couldn't find any message mentioning {name_str} and {city_str}.", "matched_message": None, "evidence": []}
+
+    if not candidate:
+        candidate = messages
 
     def has_date(text: str) -> Optional[str]:
         if not text:
@@ -226,60 +245,57 @@ async def ask(body: AskBody):
         m = re.search(r"\b\d+\b", text)
         return m.group(0) if m else None
 
+    asked_broadway = "broadway" in q_lower
+    city_bias_terms = list(asked_cities)
+
     def bonus_score(mm: Dict[str, Any]) -> int:
         text = (mm.get("text") or "")
         t = text.lower()
         base = score_message(text, question)
-        date_present = 1 if has_date(text) else 0
-        number_present = 1 if has_number(text) else 0
-        broadway_present = 1 if ("broadway" in t) else 0
-        travel_present = 1 if ("plan" in t or "planning" in t or "trip" in t or "travel" in t or "visit" in t or "fly" in t or "flying" in t) else 0
-        score = base
+        s = base
         if wants_when:
-            score += 5 * date_present
+            s += 5 * (1 if has_date(text) else 0)
         if wants_number:
-            score += 4 * number_present
+            s += 4 * (1 if has_number(text) else 0)
             if asked_broadway:
-                score += 3 * broadway_present
-        if asked_london:
-            score += 2 * (1 if "london" in t else 0)
-        if not wants_when and not wants_number and travel_present:
-            score += 2
-        return score
+                s += 3 * (1 if "broadway" in t else 0)
+        for c in city_bias_terms:
+            s += 2 * (1 if c in t else 0)
+        return s
 
-    ranked = sorted(candidate_msgs, key=bonus_score, reverse=True)
-    if not ranked:
-        return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
-
+    ranked = sorted(candidate, key=bonus_score, reverse=True)
     evidence = [{"text": (mm.get("text") or ""), "member": mm.get("member")} for mm in ranked[:5]]
 
     if wants_number:
         filtered = ranked
         if asked_broadway:
-            filtered = [mm for mm in ranked if "broadway" in (mm.get("text") or "").lower()]
-            if not filtered:
-                filtered = ranked
+            fb = [mm for mm in ranked if "broadway" in (mm.get("text") or "").lower()]
+            if fb:
+                filtered = fb
         for mm in filtered:
             num = has_number(mm.get("text") or "")
             if num:
                 return {"answer": num, "matched_message": mm.get("raw"), "evidence": evidence}
+        if q_names or asked_cities:
+            return {"answer": "No explicit number mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
+        top = ranked[0]
+        num = has_number((top.get("text") or ""))
+        if num:
+            return {"answer": num, "matched_message": top.get("raw"), "evidence": evidence}
+        return {"answer": "No number found.", "matched_message": None, "evidence": evidence}
+
+    if wants_when:
+        for mm in ranked:
+            dt = has_date(mm.get("text") or "")
+            if dt:
+                return {"answer": dt, "matched_message": mm.get("raw"), "evidence": evidence}
+        if q_names or asked_cities:
+            return {"answer": "No explicit date mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
+        top = ranked[0]
+        return {"answer": "No explicit date mentioned. Closest relevant message: " + (top.get("text") or ""), "matched_message": top.get("raw"), "evidence": evidence}
 
     top = ranked[0]
     top_text = top.get("text") or ""
-    if wants_when:
-        dt = has_date(top_text)
-        if dt:
-            return {"answer": dt, "matched_message": top.get("raw"), "evidence": evidence}
-        for mm in ranked[1:15]:
-            dt2 = has_date(mm.get("text") or "")
-            if dt2:
-                return {"answer": dt2, "matched_message": mm.get("raw"), "evidence": evidence}
-
     if "favorite" in q_lower or "favourite" in q_lower:
         return {"answer": top_text or "I couldn't extract an answer from the messages.", "matched_message": top.get("raw"), "evidence": evidence}
-
-    num_fallback = try_extract_number(top_text)
-    if wants_number and num_fallback:
-        return {"answer": num_fallback, "matched_message": top.get("raw"), "evidence": evidence}
-
     return {"answer": top_text or "I couldn't extract an answer from the messages.", "matched_message": top.get("raw"), "evidence": evidence}
