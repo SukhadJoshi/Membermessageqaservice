@@ -8,12 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+
 MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
+
 
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -25,71 +27,89 @@ app.add_middleware(
 )
 
 
-CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
-CACHE_TTL_SEC = 180  
-
 class AskBody(BaseModel):
     question: str = Field(..., description="Natural-language question to answer")
+
+  
     model_config = {
         "json_schema_extra": {
             "example": {"question": "When is Layla planning her trip to London?"}
         }
     }
 
+
 class AskResponse(BaseModel):
     answer: str
     matched_message: Optional[Dict[str, Any]] = None
 
+
+
+CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+CACHE_TTL_SEC = 180  
+
+
+
 async def fetch_messages_with_retry() -> List[Dict[str, Any]]:
-    """Try upstream up to 3 times; on total failure, use warm cache if present."""
+    """Try the upstream up to 3 times, following redirects.
+    On total failure, use a warm cache if available (<= CACHE_TTL_SEC)."""
     attempts = 3
     last_exc: Optional[Exception] = None
 
     for i in range(attempts):
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 resp = await client.get(MESSAGES_URL)
                 if resp.status_code == 200:
                     data = resp.json()
-                  
+                   
                     CACHE["data"] = data
                     CACHE["ts"] = time.time()
                     return data
                 else:
-                    last_exc = HTTPException(status_code=502, detail=f"Upstream returned {resp.status_code}")
+                    last_exc = HTTPException(
+                        status_code=502, detail=f"Upstream returned {resp.status_code}"
+                    )
         except httpx.RequestError as e:
             last_exc = e
 
-        
+      
         time.sleep(0.5 + 0.5 * i)
 
+    
     if CACHE["data"] and (time.time() - CACHE["ts"] <= CACHE_TTL_SEC):
         return CACHE["data"]
 
-    
+ 
     if isinstance(last_exc, HTTPException):
         raise last_exc
     raise HTTPException(status_code=502, detail="Upstream messages API unreachable or timed out")
 
-def find_name_in_question(q: str):
+
+
+def find_name_in_question(q: str) -> List[str]:
+    """Very simple name guesser: capitalized tokens and two-token names."""
     tokens = q.strip().split()
-    candidates = []
+    candidates: List[str] = []
     for i, t in enumerate(tokens):
         if t.istitle():
             candidates.append(t)
             if i + 1 < len(tokens) and tokens[i + 1].istitle():
                 candidates.append(t + " " + tokens[i + 1])
+  
     return list(dict.fromkeys(candidates))
+
 
 def score_message(msg_text: str, question: str) -> int:
     q_words = set(question.lower().split())
     m_words = set(msg_text.lower().split())
     return len(q_words & m_words)
 
-def try_extract_date(text: str):
+
+def try_extract_date(text: str) -> Optional[str]:
     m = re.search(
         r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?",
-        text, re.IGNORECASE,
+        text,
+        re.IGNORECASE,
     )
     if m:
         return m.group(0)
@@ -98,31 +118,37 @@ def try_extract_date(text: str):
         return m2.group(0)
     return None
 
-def try_extract_number(text: str):
+
+def try_extract_number(text: str) -> Optional[str]:
     m = re.search(r"\b\d+\b", text)
     if m:
         return m.group(0)
     return None
 
+
+
 @app.get("/")
 async def root():
     return {"status": "ok", "docs": "/docs"}
 
+
 @app.get("/healthz")
 async def healthz():
-    
+    """Health endpoint with cache age for quick diagnostics."""
     age = time.time() - CACHE["ts"] if CACHE["ts"] else None
     return {"ok": True, "cache_age_sec": age}
 
+
 @app.get("/debug/upstream")
 async def debug_upstream():
-    """Fetch upstream once (no cache) to see current status, for debugging."""
+    """Probe the upstream once (no cache) to see current status."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
             resp = await client.get(MESSAGES_URL)
             return {"status_code": resp.status_code, "ok": resp.status_code == 200}
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Upstream error: {e!s}")
+
 
 @app.post("/ask", response_model=AskResponse)
 async def ask(body: AskBody):
@@ -141,13 +167,15 @@ async def ask(body: AskBody):
     q_names = find_name_in_question(question)
     if q_names:
         filtered = [
-            mm for mm in normalized
+            mm
+            for mm in normalized
             if mm["member"] and any(n.lower() in mm["member"].lower() for n in q_names)
         ]
         candidate_msgs = filtered or normalized
     else:
         candidate_msgs = normalized
 
+    
     ranked = sorted(candidate_msgs, key=lambda mm: score_message(mm["text"], question), reverse=True)
     if not ranked:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
@@ -156,6 +184,7 @@ async def ask(body: AskBody):
     q_lower = question.lower()
     answer: Optional[str] = None
 
+   
     if ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower):
         date = try_extract_date(top["text"])
         if date:
