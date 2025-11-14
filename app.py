@@ -1,10 +1,15 @@
 import re
+from typing import Any, Dict, Optional
+
 import httpx
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 
 MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
+
 
 app = FastAPI(
     title="Member Messages QA Service",
@@ -12,7 +17,6 @@ app = FastAPI(
     version="1.0.0",
 )
 
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,16 +27,40 @@ app.add_middleware(
 )
 
 
+class AskBody(BaseModel):
+    question: str = Field(..., description="Natural-language question to answer")
+
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {"question": "When is Layla planning her trip to London?"}
+        }
+    }
+
+
+class AskResponse(BaseModel):
+    answer: str
+    matched_message: Optional[Dict[str, Any]] = None
+
+
 
 async def fetch_messages():
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(MESSAGES_URL)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Upstream messages API failed")
-        return resp.json()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(MESSAGES_URL)
+    except httpx.RequestError:
+        
+        raise HTTPException(status_code=502, detail="Upstream messages API unreachable or timed out")
+
+    if resp.status_code != 200:
+        
+        raise HTTPException(status_code=502, detail="Upstream messages API failed")
+
+    return resp.json()
 
 
 def find_name_in_question(q: str):
+    """Very simple name guesser: capitalized tokens and two-token names."""
     tokens = q.strip().split()
     candidates = []
     for i, t in enumerate(tokens):
@@ -71,79 +99,65 @@ def try_extract_number(text: str):
     return None
 
 
+
 @app.get("/")
 async def root():
-    return {"status": "ok", "message": "Use POST /ask to ask a question."}
+    return {"status": "ok", "docs": "/docs"}
 
 
-@app.post("/ask")
-async def ask(payload: dict):
-    question = payload.get("question")
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(body: AskBody):
+    question = body.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Provide 'question' in JSON body.")
+       
+        raise HTTPException(status_code=422, detail="Field 'question' must be a non-empty string.")
 
     messages = await fetch_messages()
 
+    
     normalized = []
     for m in messages:
-        text = (
-            m.get("message")
-            or m.get("text")
-            or m.get("content")
-            or str(m)
-        )
-        member = (
-            m.get("member_name")
-            or m.get("member")
-            or m.get("name")
-            or m.get("user")
-        )
+        text = m.get("message") or m.get("text") or m.get("content") or str(m)
+        member = m.get("member_name") or m.get("member") or m.get("name") or m.get("user")
         normalized.append({"raw": m, "text": text, "member": member})
 
+    
     q_names = find_name_in_question(question)
-
     if q_names:
         filtered = [
-            m
-            for m in normalized
-            if m["member"] and any(n.lower() in m["member"].lower() for n in q_names)
+            mm for mm in normalized
+            if mm["member"] and any(n.lower() in mm["member"].lower() for n in q_names)
         ]
         candidate_msgs = filtered or normalized
     else:
         candidate_msgs = normalized
 
-    ranked = sorted(
-        candidate_msgs,
-        key=lambda m: score_message(m["text"], question),
-        reverse=True,
-    )
-
+    ranked = sorted(candidate_msgs, key=lambda mm: score_message(mm["text"], question), reverse=True)
     if not ranked:
-        return JSONResponse(
-            {"answer": "I couldn't find an answer in the member messages."}
-        )
+        return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
 
     top = ranked[0]
     q_lower = question.lower()
-    answer = None
+    answer: Optional[str] = None
 
-    if "when" in q_lower or "date" in q_lower or "planning" in q_lower:
+
+    if ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower):
         date = try_extract_date(top["text"])
         if date:
             answer = date
-    elif "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
+    elif ("how many" in q_lower) or ("number" in q_lower) or ("cars" in q_lower):
         num = try_extract_number(top["text"])
         if num:
             answer = num
-    elif "favorite" in q_lower or "favourite" in q_lower:
+    elif ("favorite" in q_lower) or ("favourite" in q_lower):
         answer = top["text"]
 
     if not answer:
         answer = top["text"]
 
-    return JSONResponse(
-        {
-            "answer": answer,
-            "matched_message": top["raw"],
-        }
-    )
+    return {"answer": answer, "matched_message": top["raw"]}
