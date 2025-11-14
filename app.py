@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -176,32 +176,55 @@ async def ask(body: AskBody):
         raise HTTPException(status_code=502, detail="Unexpected upstream handling error")
     if not messages:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
+
+    q_lower = question.lower()
     q_names = find_name_in_question(question)
+    wants_when = ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower)
+    travel_words = ("plan" in q_lower) or ("planning" in q_lower) or ("trip" in q_lower) or ("travel" in q_lower) or ("visit" in q_lower) or ("fly" in q_lower) or ("flying" in q_lower)
+    asked_london = "london" in q_lower
+
+    candidate_msgs = messages
     if q_names:
-        filtered = [
+        filtered_by_name = [
             mm for mm in messages
             if mm.get("member") and any(n.lower() in mm["member"].lower() for n in q_names)
         ]
-        candidate_msgs = filtered or messages
-    else:
-        candidate_msgs = messages
-    ranked = sorted(candidate_msgs, key=lambda mm: score_message(mm.get("text", ""), question), reverse=True)
+        if filtered_by_name:
+            candidate_msgs = filtered_by_name
+
+    if asked_london:
+        filtered_by_city = [mm for mm in candidate_msgs if "london" in (mm.get("text") or "").lower()]
+        if filtered_by_city:
+            candidate_msgs = filtered_by_city
+
+    def bonus_score(mm: Dict[str, Any]) -> int:
+        text = (mm.get("text") or "")
+        t = text.lower()
+        base = score_message(text, question)
+        date_present = 1 if try_extract_date(text) else 0
+        travel_present = 1 if ("plan" in t or "planning" in t or "trip" in t or "travel" in t or "visit" in t or "fly" in t or "flying" in t) else 0
+        london_present = 1 if ("london" in t) else 0
+        return base + (3 * date_present) + (2 * london_present if asked_london else 0) + (2 * travel_present if travel_words else 0)
+
+    ranked = sorted(candidate_msgs, key=bonus_score, reverse=True)
     if not ranked:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
+
     top = ranked[0]
-    q_lower = question.lower()
+    text = top.get("text") or ""
     answer: Optional[str] = None
-    text = top.get("text", "")
-    if ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower):
+
+    if wants_when:
         date = try_extract_date(text)
         if date:
             answer = date
-    elif ("how many" in q_lower) or ("number" in q_lower) or ("cars" in q_lower):
+    elif "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
         num = try_extract_number(text)
         if num:
             answer = num
-    elif ("favorite" in q_lower) or ("favourite" in q_lower):
+    elif "favorite" in q_lower or "favourite" in q_lower:
         answer = text
+
     if not answer:
         answer = text or "I couldn't extract an answer from the messages."
     return {"answer": answer, "matched_message": top.get("raw")}
