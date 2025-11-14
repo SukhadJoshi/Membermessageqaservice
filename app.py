@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.6.0",
+    version="1.7.0",
 )
 
 app.add_middleware(
@@ -192,8 +192,9 @@ async def ask(body: AskBody):
     q_lower = question.lower()
     q_names = find_name_in_question(question)
     wants_when = ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower)
-    travel_words = ("plan" in q_lower) or ("planning" in q_lower) or ("trip" in q_lower) or ("travel" in q_lower) or ("visit" in q_lower) or ("fly" in q_lower) or ("flying" in q_lower)
+    wants_number = ("how many" in q_lower) or ("number" in q_lower)
     asked_london = "london" in q_lower
+    asked_broadway = "broadway" in q_lower
 
     candidate_msgs = messages
     if q_names:
@@ -205,52 +206,80 @@ async def ask(body: AskBody):
         if filtered_by_city:
             candidate_msgs = filtered_by_city
 
+    def has_date(text: str) -> Optional[str]:
+        if not text:
+            return None
+        m1 = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?", text, re.IGNORECASE)
+        if m1:
+            return m1.group(0)
+        m2 = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+        if m2:
+            return m2.group(0)
+        m3 = re.search(r"\b(?:tomorrow|today|tonight|this weekend|next week|next month|this week)\b", text, re.IGNORECASE)
+        if m3:
+            return m3.group(0)
+        return None
+
+    def has_number(text: str) -> Optional[str]:
+        if not text:
+            return None
+        m = re.search(r"\b\d+\b", text)
+        return m.group(0) if m else None
+
     def bonus_score(mm: Dict[str, Any]) -> int:
         text = (mm.get("text") or "")
         t = text.lower()
         base = score_message(text, question)
-        date_present = 1 if try_extract_date(text) else 0
+        date_present = 1 if has_date(text) else 0
+        number_present = 1 if has_number(text) else 0
+        broadway_present = 1 if ("broadway" in t) else 0
         travel_present = 1 if ("plan" in t or "planning" in t or "trip" in t or "travel" in t or "visit" in t or "fly" in t or "flying" in t) else 0
-        london_present = 1 if ("london" in t) else 0
-        return base + (5 * date_present if wants_when else 0) + (2 * london_present if asked_london else 0) + (2 * travel_present if travel_words else 0)
+        score = base
+        if wants_when:
+            score += 5 * date_present
+        if wants_number:
+            score += 4 * number_present
+            if asked_broadway:
+                score += 3 * broadway_present
+        if asked_london:
+            score += 2 * (1 if "london" in t else 0)
+        if not wants_when and not wants_number and travel_present:
+            score += 2
+        return score
 
     ranked = sorted(candidate_msgs, key=bonus_score, reverse=True)
     if not ranked:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
 
-    def first_with_date(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        for mm in items:
-            if try_extract_date(mm.get("text") or ""):
-                return mm
-        return None
+    evidence = [{"text": (mm.get("text") or ""), "member": mm.get("member")} for mm in ranked[:5]]
+
+    if wants_number:
+        filtered = ranked
+        if asked_broadway:
+            filtered = [mm for mm in ranked if "broadway" in (mm.get("text") or "").lower()]
+            if not filtered:
+                filtered = ranked
+        for mm in filtered:
+            num = has_number(mm.get("text") or "")
+            if num:
+                return {"answer": num, "matched_message": mm.get("raw"), "evidence": evidence}
 
     top = ranked[0]
     top_text = top.get("text") or ""
-    answer: Optional[str] = None
-    ev: List[Dict[str, Any]] = [{"text": (mm.get("text") or ""), "member": mm.get("member")} for mm in ranked[:5]]
-
     if wants_when:
-        dt = try_extract_date(top_text)
+        dt = has_date(top_text)
         if dt:
-            answer = dt
-        else:
-            alt = first_with_date(ranked[1:15])
-            if alt:
-                top = alt
-                top_text = alt.get("text") or ""
-                answer = try_extract_date(top_text)
+            return {"answer": dt, "matched_message": top.get("raw"), "evidence": evidence}
+        for mm in ranked[1:15]:
+            dt2 = has_date(mm.get("text") or "")
+            if dt2:
+                return {"answer": dt2, "matched_message": mm.get("raw"), "evidence": evidence}
 
-    if not answer:
-        if "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
-            num = try_extract_number(top_text)
-            if num:
-                answer = num
-    if not answer and ("favorite" in q_lower or "favourite" in q_lower):
-        answer = top_text
-    if not answer:
-        if wants_when:
-            answer = "No explicit date mentioned. Closest relevant message: " + top_text
-        else:
-            answer = top_text or "I couldn't extract an answer from the messages."
+    if "favorite" in q_lower or "favourite" in q_lower:
+        return {"answer": top_text or "I couldn't extract an answer from the messages.", "matched_message": top.get("raw"), "evidence": evidence}
 
-    return {"answer": answer, "matched_message": top.get("raw"), "evidence": ev}
+    num_fallback = try_extract_number(top_text)
+    if wants_number and num_fallback:
+        return {"answer": num_fallback, "matched_message": top.get("raw"), "evidence": evidence}
+
+    return {"answer": top_text or "I couldn't extract an answer from the messages.", "matched_message": top.get("raw"), "evidence": evidence}
