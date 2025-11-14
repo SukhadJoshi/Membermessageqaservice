@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 app.add_middleware(
@@ -191,40 +191,67 @@ async def ask(body: AskBody):
         ]
         if filtered_by_name:
             candidate_msgs = filtered_by_name
-
     if asked_london:
         filtered_by_city = [mm for mm in candidate_msgs if "london" in (mm.get("text") or "").lower()]
         if filtered_by_city:
             candidate_msgs = filtered_by_city
 
+    def has_date(text: str) -> Optional[str]:
+        if not text:
+            return None
+        m1 = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?", text, re.IGNORECASE)
+        if m1:
+            return m1.group(0)
+        m2 = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
+        if m2:
+            return m2.group(0)
+        m3 = re.search(r"\b(?:tomorrow|today|tonight|this weekend|next week|next month|this week)\b", text, re.IGNORECASE)
+        if m3:
+            return m3.group(0)
+        return None
+
     def bonus_score(mm: Dict[str, Any]) -> int:
         text = (mm.get("text") or "")
         t = text.lower()
         base = score_message(text, question)
-        date_present = 1 if try_extract_date(text) else 0
+        date_token = has_date(text)
+        date_present = 1 if date_token else 0
         travel_present = 1 if ("plan" in t or "planning" in t or "trip" in t or "travel" in t or "visit" in t or "fly" in t or "flying" in t) else 0
         london_present = 1 if ("london" in t) else 0
-        return base + (3 * date_present) + (2 * london_present if asked_london else 0) + (2 * travel_present if travel_words else 0)
+        return base + (5 * date_present if wants_when else 0) + (2 * london_present if asked_london else 0) + (2 * travel_present if travel_words else 0)
 
     ranked = sorted(candidate_msgs, key=bonus_score, reverse=True)
     if not ranked:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
 
     top = ranked[0]
-    text = top.get("text") or ""
+    top_text = top.get("text") or ""
     answer: Optional[str] = None
 
     if wants_when:
-        date = try_extract_date(text)
-        if date:
-            answer = date
-    elif "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
-        num = try_extract_number(text)
-        if num:
-            answer = num
-    elif "favorite" in q_lower or "favourite" in q_lower:
-        answer = text
+        dt = has_date(top_text)
+        if dt:
+            answer = dt
+        else:
+            for mm in ranked[1:10]:
+                dt2 = has_date(mm.get("text") or "")
+                if dt2:
+                    top = mm
+                    top_text = mm.get("text") or ""
+                    answer = dt2
+                    break
 
     if not answer:
-        answer = text or "I couldn't extract an answer from the messages."
+        if "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
+            num = try_extract_number(top_text)
+            if num:
+                answer = num
+    if not answer and ("favorite" in q_lower or "favourite" in q_lower):
+        answer = top_text
+    if not answer:
+        if wants_when:
+            answer = "No explicit date mentioned. Closest relevant message: " + top_text
+        else:
+            answer = top_text or "I couldn't extract an answer from the messages."
+
     return {"answer": answer, "matched_message": top.get("raw")}
