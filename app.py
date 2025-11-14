@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.8.0",
+    version="1.9.0",
 )
 
 app.add_middleware(
@@ -181,7 +181,7 @@ async def ask(body: AskBody):
         messages = await fetch_messages_with_retry()
     except HTTPException as e:
         raise e
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=502, detail="Unexpected upstream handling error")
     if not messages:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
@@ -190,6 +190,8 @@ async def ask(body: AskBody):
     q_names = find_name_in_question(question)
     wants_when = ("when" in q_lower) or ("date" in q_lower) or ("planning" in q_lower)
     wants_number = ("how many" in q_lower) or ("number" in q_lower)
+    wants_meeting = ("meeting" in q_lower) or ("meet" in q_lower)
+    asked_broadway = "broadway" in q_lower
 
     city_terms = {"london","paris","berlin","tokyo","dubai","zurich","vatican","rome","madrid","amsterdam","new york","san francisco","chicago","los angeles","la","seattle"}
     asked_cities = {c for c in city_terms if c in q_lower}
@@ -214,39 +216,22 @@ async def ask(body: AskBody):
             t = (mm.get("text") or "").lower()
             if any(c in t for c in asked_cities):
                 by_city.append(mm)
-        if by_city:
-            candidate = by_city
+        if not by_city:
+            city_str = ", ".join(sorted(asked_cities))
+            return {"answer": f"I couldn't find any message mentioning {city_str}.", "matched_message": None, "evidence": []}
+        candidate = by_city
 
-    if (q_names and asked_cities) and not candidate:
-        name_str = q_names[0]
-        city_str = ", ".join(sorted(asked_cities))
-        return {"answer": f"I couldn't find any message mentioning {name_str} and {city_str}.", "matched_message": None, "evidence": []}
-
-    if not candidate:
-        candidate = messages
-
-    def has_date(text: str) -> Optional[str]:
-        if not text:
-            return None
-        m1 = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?", text, re.IGNORECASE)
-        if m1:
-            return m1.group(0)
-        m2 = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
-        if m2:
-            return m2.group(0)
-        m3 = re.search(r"\b(?:tomorrow|today|tonight|this weekend|next week|next month|this week)\b", text, re.IGNORECASE)
-        if m3:
-            return m3.group(0)
-        return None
-
-    def has_number(text: str) -> Optional[str]:
-        if not text:
-            return None
-        m = re.search(r"\b\d+\b", text)
-        return m.group(0) if m else None
-
-    asked_broadway = "broadway" in q_lower
-    city_bias_terms = list(asked_cities)
+    if wants_meeting:
+        by_meeting = []
+        for mm in candidate:
+            t = (mm.get("text") or "").lower()
+            if ("meeting" in t) or ("meet " in t) or (t.endswith(" meet")) or ("meet." in t) or ("meet?" in t) or ("meet!" in t):
+                by_meeting.append(mm)
+        if by_meeting:
+            candidate = by_meeting
+        elif asked_cities:
+            city_str = ", ".join(sorted(asked_cities))
+            return {"answer": f"No messages about a meeting found for {city_str}.", "matched_message": None, "evidence": []}
 
     def bonus_score(mm: Dict[str, Any]) -> int:
         text = (mm.get("text") or "")
@@ -254,16 +239,21 @@ async def ask(body: AskBody):
         base = score_message(text, question)
         s = base
         if wants_when:
-            s += 5 * (1 if has_date(text) else 0)
+            s += 5 * (1 if try_extract_date(text) else 0)
         if wants_number:
-            s += 4 * (1 if has_number(text) else 0)
+            s += 4 * (1 if try_extract_number(text) else 0)
             if asked_broadway:
                 s += 3 * (1 if "broadway" in t else 0)
-        for c in city_bias_terms:
+        if wants_meeting:
+            s += 3 * (1 if ("meeting" in t or "meet " in t or t.endswith(" meet") or "meet." in t or "meet?" in t or "meet!" in t) else 0)
+        for c in asked_cities:
             s += 2 * (1 if c in t else 0)
         return s
 
     ranked = sorted(candidate, key=bonus_score, reverse=True)
+    if not ranked:
+        return {"answer": "No relevant messages found.", "matched_message": None, "evidence": []}
+
     evidence = [{"text": (mm.get("text") or ""), "member": mm.get("member")} for mm in ranked[:5]]
 
     if wants_number:
@@ -273,26 +263,17 @@ async def ask(body: AskBody):
             if fb:
                 filtered = fb
         for mm in filtered:
-            num = has_number(mm.get("text") or "")
+            num = try_extract_number(mm.get("text") or "")
             if num:
                 return {"answer": num, "matched_message": mm.get("raw"), "evidence": evidence}
-        if q_names or asked_cities:
-            return {"answer": "No explicit number mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
-        top = ranked[0]
-        num = has_number((top.get("text") or ""))
-        if num:
-            return {"answer": num, "matched_message": top.get("raw"), "evidence": evidence}
-        return {"answer": "No number found.", "matched_message": None, "evidence": evidence}
+        return {"answer": "No explicit number mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
 
     if wants_when:
         for mm in ranked:
-            dt = has_date(mm.get("text") or "")
+            dt = try_extract_date(mm.get("text") or "")
             if dt:
                 return {"answer": dt, "matched_message": mm.get("raw"), "evidence": evidence}
-        if q_names or asked_cities:
-            return {"answer": "No explicit date mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
-        top = ranked[0]
-        return {"answer": "No explicit date mentioned. Closest relevant message: " + (top.get("text") or ""), "matched_message": top.get("raw"), "evidence": evidence}
+        return {"answer": "No explicit date mentioned in the relevant messages.", "matched_message": None, "evidence": evidence}
 
     top = ranked[0]
     top_text = top.get("text") or ""
