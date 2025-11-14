@@ -4,7 +4,7 @@ import asyncio
 from typing import Any, Dict, Optional, List
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -14,7 +14,7 @@ MESSAGES_URL = "https://november7-730026606190.europe-west1.run.app/messages"
 app = FastAPI(
     title="Member Messages QA Service",
     description="Ask natural-language questions about member messages.",
-    version="1.5.0",
+    version="1.6.0",
 )
 
 app.add_middleware(
@@ -27,15 +27,12 @@ app.add_middleware(
 
 class AskBody(BaseModel):
     question: str = Field(..., description="Natural-language question to answer")
-    model_config = {
-        "json_schema_extra": {
-            "example": {"question": "When is Layla planning her trip to London?"}
-        }
-    }
+    model_config = {"json_schema_extra": {"example": {"question": "When is Layla planning her trip to London?"}}}
 
 class AskResponse(BaseModel):
     answer: str
     matched_message: Optional[Dict[str, Any]] = None
+    evidence: Optional[List[Dict[str, Any]]] = None
 
 CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 CACHE_TTL_SEC = 180
@@ -80,19 +77,22 @@ def score_message(msg_text: str, question: str) -> int:
     return len(q_words & m_words)
 
 def try_extract_date(text: str) -> Optional[str]:
-    m = re.search(
-        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?",
-        text,
-        re.IGNORECASE,
-    )
-    if m:
-        return m.group(0)
+    if not text:
+        return None
+    m1 = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?", text, re.IGNORECASE)
+    if m1:
+        return m1.group(0)
     m2 = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
     if m2:
         return m2.group(0)
+    m3 = re.search(r"\b(?:tomorrow|today|tonight|this weekend|next week|next month|this week)\b", text, re.IGNORECASE)
+    if m3:
+        return m3.group(0)
     return None
 
 def try_extract_number(text: str) -> Optional[str]:
+    if not text:
+        return None
     m = re.search(r"\b\d+\b", text)
     if m:
         return m.group(0)
@@ -162,6 +162,18 @@ async def debug_sample():
     except HTTPException as e:
         return JSONResponse({"debug": "normalization failed", "detail": e.detail}, status_code=e.status_code)
 
+@app.get("/inspect")
+async def inspect(query: str = Query(..., min_length=1), require_date: bool = Query(False)):
+    msgs = await fetch_messages_with_retry()
+    out = []
+    q = query.lower()
+    for m in msgs:
+        t = (m.get("text") or "")
+        if q in t.lower():
+            if not require_date or try_extract_date(t):
+                out.append({"text": t, "member": m.get("member"), "has_date": bool(try_extract_date(t)), "raw": m.get("raw")})
+    return {"count": len(out), "matches": out[:50]}
+
 @app.post("/ask", response_model=AskResponse)
 async def ask(body: AskBody):
     question = body.question.strip()
@@ -185,10 +197,7 @@ async def ask(body: AskBody):
 
     candidate_msgs = messages
     if q_names:
-        filtered_by_name = [
-            mm for mm in messages
-            if mm.get("member") and any(n.lower() in mm["member"].lower() for n in q_names)
-        ]
+        filtered_by_name = [mm for mm in messages if mm.get("member") and any(n.lower() in mm["member"].lower() for n in q_names)]
         if filtered_by_name:
             candidate_msgs = filtered_by_name
     if asked_london:
@@ -196,26 +205,11 @@ async def ask(body: AskBody):
         if filtered_by_city:
             candidate_msgs = filtered_by_city
 
-    def has_date(text: str) -> Optional[str]:
-        if not text:
-            return None
-        m1 = re.search(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:,\s*\d{4})?", text, re.IGNORECASE)
-        if m1:
-            return m1.group(0)
-        m2 = re.search(r"\b\d{4}-\d{2}-\d{2}\b", text)
-        if m2:
-            return m2.group(0)
-        m3 = re.search(r"\b(?:tomorrow|today|tonight|this weekend|next week|next month|this week)\b", text, re.IGNORECASE)
-        if m3:
-            return m3.group(0)
-        return None
-
     def bonus_score(mm: Dict[str, Any]) -> int:
         text = (mm.get("text") or "")
         t = text.lower()
         base = score_message(text, question)
-        date_token = has_date(text)
-        date_present = 1 if date_token else 0
+        date_present = 1 if try_extract_date(text) else 0
         travel_present = 1 if ("plan" in t or "planning" in t or "trip" in t or "travel" in t or "visit" in t or "fly" in t or "flying" in t) else 0
         london_present = 1 if ("london" in t) else 0
         return base + (5 * date_present if wants_when else 0) + (2 * london_present if asked_london else 0) + (2 * travel_present if travel_words else 0)
@@ -224,22 +218,27 @@ async def ask(body: AskBody):
     if not ranked:
         return JSONResponse({"answer": "I couldn't find an answer in the member messages.", "matched_message": None})
 
+    def first_with_date(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for mm in items:
+            if try_extract_date(mm.get("text") or ""):
+                return mm
+        return None
+
     top = ranked[0]
     top_text = top.get("text") or ""
     answer: Optional[str] = None
+    ev: List[Dict[str, Any]] = [{"text": (mm.get("text") or ""), "member": mm.get("member")} for mm in ranked[:5]]
 
     if wants_when:
-        dt = has_date(top_text)
+        dt = try_extract_date(top_text)
         if dt:
             answer = dt
         else:
-            for mm in ranked[1:10]:
-                dt2 = has_date(mm.get("text") or "")
-                if dt2:
-                    top = mm
-                    top_text = mm.get("text") or ""
-                    answer = dt2
-                    break
+            alt = first_with_date(ranked[1:15])
+            if alt:
+                top = alt
+                top_text = alt.get("text") or ""
+                answer = try_extract_date(top_text)
 
     if not answer:
         if "how many" in q_lower or "number" in q_lower or "cars" in q_lower:
@@ -254,4 +253,4 @@ async def ask(body: AskBody):
         else:
             answer = top_text or "I couldn't extract an answer from the messages."
 
-    return {"answer": answer, "matched_message": top.get("raw")}
+    return {"answer": answer, "matched_message": top.get("raw"), "evidence": ev}
