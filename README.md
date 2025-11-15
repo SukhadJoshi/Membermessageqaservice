@@ -3,9 +3,9 @@
 Ask natural-language questions about a stream of “member messages” and get precise answers (dates, counts, or the most relevant message), with strict filtering by person name, city, and intent (e.g., meeting/tickets). Built with FastAPI and deployable to Render.
 
 
--- Live URLs (example)
+-- Live URLs
 
-Your service (FastAPI + Swagger UI):
+FastAPI + Swagger UI:
 https://membermessageqaservice.onrender.com/docs
 
 Health check:
